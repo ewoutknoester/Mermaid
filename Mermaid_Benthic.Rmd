@@ -1,0 +1,241 @@
+---
+title: "Mermaid Benthic"
+author: "Ewout Knoester"
+date: "25/04/2023"
+output: html_document
+
+Logbook:
+  2023-04-26: Imported all benthic surveys on natural (Reference) reefs from 2017 up to 2023-04 into Mermaid. This excludes all surveys that were done on Control patches (or were Excluded as Reference transect due to low hard substrate) and also excludes all surveys done on restored reef patches. In total, 170 surveys were imported.
+  
+---
+
+```{r setup, include=FALSE}
+
+rm(list=ls()) # Clear workspace
+knitr::opts_knit$set(root.dir = '/tmp') #Set directory at current directory for all subsequent chunks
+options(scipen = 50) # Have all numbers in non-scientific notation
+
+library(car) # Anovas
+library(cowplot) # Plot grid
+library(data.table)
+library(emmeans) # Pairwise comparisons
+library(ggthemes) # pretty plots
+library(mermaidr)
+library(NCmisc) # Check packages used
+library(nlme) # GLS
+library(panelr) # Convert data from wide to long
+library(plyr) # Join (vlookup)
+library(readxl) # Import excel sheets
+library(tidyverse) # Data manipulation and plotting
+library(writexl) # Export Excel
+
+data_summary <- function(data, varname, groupnames){
+  require(plyr)
+  summary_func <- function(x, col){
+    c(sum = sum(x[[col]]),
+      mean = mean(x[[col]], na.rm=TRUE),
+      sd = sd(x[[col]], na.rm=TRUE),
+      n  = length(x[[col]]),
+      se = sd(x[[col]], na.rm=TRUE)/sqrt(length(x[[col]])))
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- plyr::rename(data_sum, c("mean" = varname))
+ return(data_sum)
+}
+
+```
+
+# Establish MERMAID connection
+```{r connect}
+
+# Log in
+project <- mermaid_get_my_projects()
+
+# Get most recent template for benthic input
+mermaid_import_get_template_and_options(
+  project = project,
+  method = "benthicpit",
+  save = "Raw data/Template_benthic.xlsx",
+  token = mermaid_token()
+)
+
+```
+
+
+# Data selection (preparing dataset for archiving & sharing)
+```{r data selection}
+
+# Import and clean RAW data
+## load first xls sheet
+df0.raw <- read_excel("Raw data/Benthic surveys_2023-04.xlsx", sheet = 3, skip = 1)
+
+## combining next sheets of excel file
+for (i in 4:6) {
+  temp <- read_excel("Raw data/Benthic surveys_2023-04.xlsx", sheet = i, skip = 1)
+  df0.raw <- cbind(df0.raw, temp)
+}
+rm(temp) # Clear temp data
+
+## Remove duplicate columns
+df1.clean <- df0.raw[-c(802, 1603, 2404)]
+
+## Convert to long dataframe
+df1.clean <- as.data.frame(long_panel(df1.clean, prefix = "_", begin = 1, end = 400, label_location = "end"))
+df1.clean <- df1.clean[order(df1.clean$wave),]
+
+## Select benthic attribute level that matches with Mermaid
+### Clean data
+df1.clean[df1.clean == "#N/A"]  <- NA # Standardize NAs
+df1.clean[is.na(df1.clean)] <- "Unknown" # Remove NAs
+df1.clean <- as.data.frame(apply(df1.clean, 2, tolower)) # Standardize cases
+
+### Filter through data until first non-unknown
+df1.clean$Attribute <- ifelse(df1.clean$Super.group == "unknown", "unknown", df1.clean$Super.group)
+df1.clean$Attribute <- ifelse(df1.clean$Group == "unknown", df1.clean$Attribute, df1.clean$Group)
+df1.clean$Attribute <- ifelse(df1.clean$Family == "unknown", df1.clean$Attribute, df1.clean$Family)
+df1.clean$Attribute <- ifelse(df1.clean$Genus == "unknown", df1.clean$Attribute, df1.clean$Genus)
+df1.clean$Attribute <- ifelse(df1.clean$Species == "unknown", df1.clean$Attribute, df1.clean$Species)
+
+### Make names match
+df1.clean$Attribute <- recode_factor(df1.clean$Attribute, coral.rubble = "Rubble", 
+                                                          corallimorph = "Corallimorpharia",
+                                                          sea.anemone = "Anemone",
+                                                          brown.algae = "Phaeophyceae")
+
+### Make punctuation match
+df1.clean$Attribute <- gsub('\\.', ' ', df1.clean$Attribute) # Replace points with spaces
+df1.clean$Attribute <- str_to_sentence(df1.clean$Attribute) # Capitalize
+df1.clean$Attribute <- as.factor(df1.clean$Attribute)
+
+### Add Growth form
+df1.clean$Growthform <- ifelse(df1.clean$Code == "por mas", "Massive", "")
+
+### Cleanup dataframe
+df1.clean <- select(df1.clean, -c("id", "Code", "Species", "Genus", "Family", "Group", "Super.group", "State", "Comments"))
+df1.clean <- df1.clean %>% 
+  rename(
+    Observation.interval = Points.m,
+    Survey = wave
+    )
+df1.clean$Survey  <- str_trim(df1.clean$Survey, "left")
+
+
+# Import and clean META data
+## Load Excel
+meta <- read_excel("Raw data/Benthic surveys_2023-04.xlsx", sheet = 2)
+
+## Change survey code to number
+meta$Survey <- sub(".", "", meta$Survey)
+meta$Survey  = str_remove(meta$Survey, "^0+")
+
+## Match location names with MERMAID Site names
+meta$Site <- tolower(meta$Location) # All to lower case for searching
+meta$Site <- as.factor(ifelse(meta$Site  == 'firefly', "House Reef Firefly",
+                  ifelse(meta$Site  == 'pilli pipa', "Pilli Pipa Restaurant", 
+                   ifelse(meta$Site  == 'lower mpunguti', "Lower Mpunguti", 
+                    ifelse(meta$Site  == 'dolphin point', "Dolphin Point", 
+                     ifelse(meta$Site  == 'wasini', "Wasini Tengefu", 
+                      ifelse(meta$Site  == 'inner kisite', "Kisite 2",      
+                        ifelse(meta$Site  == 'outer kisite', "Outer Kisite",
+                         ifelse(meta$Site  == 'giraffe point', "Kisite Edge 2", 
+                          ifelse(meta$Site  == 'mkwiro cma', "Mkwiro CMA",
+                           ifelse(meta$Site  == 'kikuyu house', "Kikuyu House", "Unknown site")))))))))))
+
+## Set Management level
+meta$Management <- as.factor(
+                 ifelse(meta$Site  == 'House Reef Firefly', "Wasini Channel",
+                  ifelse(meta$Site  == 'Pilli Pipa Restaurant', "Wasini Channel", 
+                   ifelse(meta$Site  == 'Lower Mpunguti', "Kisite-Mpunguti Marine Reserve", 
+                    ifelse(meta$Site  == 'Dolphin Point', "Kisite-Mpunguti Marine Reserve", 
+                     ifelse(meta$Site  == 'Wasini Tengefu', "Wasini Tengefu", 
+                      ifelse(meta$Site  == 'Kisite 2', "Kisite-Mpunguti Marine National Park",      
+                        ifelse(meta$Site  == 'Outer Kisite', "Kisite-Mpunguti Marine National Park",
+                         ifelse(meta$Site  == 'Kisite Edge 2', "Kisite-Mpunguti Marine National Park", 
+                          ifelse(meta$Site  == 'Mkwiro CMA', "Mkwiro CMA",
+                           ifelse(meta$Site  == 'Kikuyu House', "Mkwiro tengefu", "Unknown Management")))))))))))
+
+## Split date into categories to match template
+meta <- meta %>%
+                dplyr::mutate(Year = lubridate::year(Date), 
+                Month = lubridate::month(Date), 
+                Day = lubridate::day(Date))
+
+## Extract Time from Start time
+meta$Sample.time <- strftime(meta$Time.start, format = "%H:%M:%S")
+
+## Extract Depth from Comments
+meta$Depth <- str_extract(meta$Comments, "\\d+\\.*\\d*")
+
+## Create Transect details
+meta$Transect.number <- 1
+meta$Transect.length <- 20
+meta$Transect.interval <- 0.5
+meta$Transect.start <- 0
+
+## Other info
+meta$Observer <- "ewoutknoester@hotmail.com"
+
+## Cleanup meta
+meta <- meta %>% drop_na(Date)
+meta <- select(meta, -c("Date", "GPS", "Time.start", "Time.end", "Duration.min", "Survey.type", "Location"))
+
+# MERGE data with meta
+df2.clean <- left_join(df1.clean, meta)
+
+## Cleanup
+df2.clean$Survey <- as.numeric(df2.clean$Survey)
+df2.clean$Depth <- as.numeric(df2.clean$Depth)
+df2.clean$Observation.interval <- as.numeric(df2.clean$Observation.interval)
+
+# SELECTION
+
+## Load sheet with transect categories
+cats <- read_excel("Raw data/Measurements timeline_2023-04.xlsx", sheet = 2)
+cats <- cats %>% 
+  rename(
+    Transect = Patch,
+    Treatment = Type)
+cats <- select(cats, c("Transect", "Treatment"))
+
+## Merge
+df2.clean <- left_join(df2.clean, cats)
+df2.clean <- df2.clean %>%
+  mutate_at(vars(Treatment), ~replace_na(., "Reference"))
+
+## Remove non-usable surveys
+df2.clean <- df2.clean %>% drop_na(Year) # Drop empty surveys
+df2.clean <- df2.clean[!grepl("Exclude", df2.clean$Comments),] # Drop surveys that weren't performed properly
+df2.clean <- subset(df2.clean, Treatment == 'Reference') # Select surveys on natural, hard substrate reefs only
+
+# CLEANUP
+## Make order match with Template
+df2.clean <- select(df2.clean, c("Site", "Management", "Year", "Month", "Day", "Sample.time", "Depth", "Survey", "Transect",
+                                 "Transect.length", "Transect.interval", "Transect.start", "Observer", "Observation.interval",
+                                 "Attribute", "Growthform"))
+
+# Add missing variables
+df2.clean <- df2.clean %>%
+  add_column(Reef.slope = "", Visibility = "", Current = "", Depth.relative = "", Tide = "", Notes = "",
+             .after = "Transect.start") 
+
+# EXPORT
+write_xlsx(df2.clean, "Mermaid_Benthic_Reference_2017-2023.xlsx")
+
+```
+# Data input validation
+```{r check}
+
+df3.check <- read_excel("Template_benthic_Filled 2023-04.xlsx", sheet = 1)
+
+mermaid_import_project_data(
+  df3.check,
+  project,
+  method = "benthicpit",
+  dryrun = FALSE,
+  clearexisting = FALSE,
+  token = mermaid_token()
+)
+
+```
+
